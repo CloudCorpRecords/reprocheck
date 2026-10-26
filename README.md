@@ -22,6 +22,33 @@ The standard red-first setup has an awkward step: the regression test is new, so
 
 Your working tree is never modified. Both runs happen in temporary worktrees under the OS temp dir, and they are removed on every exit path.
 
+## Native runners: pytest and Go
+
+You do not have to hand write the test command for Python or Go repos. Pass `--runner pytest`, `--runner go`, or `--runner auto` and reprocheck detects the repo's test setup, builds the real command, and runs it in both worktrees:
+
+- pytest detection: a pytest config (`pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini`) or `test_*.py` / `*_test.py` files. The command is `python3 -m pytest '<file>::<test name>' -q` (file or whole suite when no name is given).
+- Go detection: a `go.mod` file or `*_test.go` files. The command is `go test <package> -run '^<TestName>$' -count=1 -v`, with `-count=1` so the Go test cache can never turn a stale pass into evidence.
+- `--test-name <name>` targets one named test (`test_add` for pytest, `TestAdd` for Go). Detection finds which test file defines it.
+- Asking for the wrong runner, a test file that belongs to another runner, a test name that does not exist, or any runner in a repo with no tests at all fails before anything runs, with that specific error. Nothing is rounded up to a verdict it did not earn.
+- `reprocheck detect --repo <path>` (or the MCP `detect_test_runners` tool) reports the detected runners and the filesystem evidence for each, without running any target code.
+
+```bash
+# Python: one named pytest test, red on main and green on HEAD
+npx @reneturcios/reprocheck run --repo . --base main --head HEAD \
+  --runner pytest --test-file test_calc.py --test-name test_add
+
+# Go: one named test, package inferred from the test file
+npx @reneturcios/reprocheck run --repo . --base main --head HEAD \
+  --runner go --test-file calc_test.go --test-name TestAdd
+
+# See what a repo supports before choosing
+npx @reneturcios/reprocheck detect --repo . --json
+```
+
+## The receipt
+
+Every report carries a machine readable red/green receipt: `receipt` in the `--json` output, with `schemaVersion: 1`, `kind: "reprocheck.receipt"`, the verdict, the runner, and a `red` (base) and `green` (head) block holding ref, SHA, exit code, outcome (`pass`, `fail`, or `did-not-run`), timeout flag, and duration. Write just the receipt to a file with `--receipt <path>`, for example to attach it to a PR description or a CI artifact. A receipt is evidence, not a summary: it records exactly the two runs the verdict rests on.
+
 ## Usage
 
 ### CLI
@@ -37,8 +64,8 @@ npx @reneturcios/reprocheck run \
 # Simpler: a committed repro script, no setup
 npx @reneturcios/reprocheck run --repo . --base HEAD~1 --head HEAD --cmd "node repro.mjs"
 
-# Machine readable output
-npx @reneturcios/reprocheck run --repo . --base main --head HEAD --cmd "npm test" --json
+# Machine readable output, with the receipt written to a file
+npx @reneturcios/reprocheck run --repo . --base main --head HEAD --cmd "npm test" --json --receipt receipt.json
 ```
 
 Example output (real dogfood, verifying Greenlight v0.15.1's radar precision fix, where the regression tests in `test/radar.test.ts` were written against the fixed behavior):
@@ -68,7 +95,7 @@ Add to your MCP client config:
 }
 ```
 
-Tool: `run_repro_check`: repoPath, baseRef, headRef, command, and optional testFile, setupCommand, and timeoutSeconds. Returns the full report as JSON, including per-phase exit codes, durations, and output tails.
+Tools: `run_repro_check` (repoPath, baseRef, headRef, and either a raw command or a native `runner` of pytest, go, or auto, with optional testFile, testName, setupCommand, and timeoutSeconds; returns the full report as JSON, including the receipt, per-phase exit codes, durations, and output tails) and `detect_test_runners` (repoPath; returns the detected native runners with their evidence and test files).
 
 ### Docker
 
@@ -95,7 +122,7 @@ All three come from the same discipline that runs [Greenlight](https://github.co
 ```bash
 npm install
 npm run build
-npm test   # 12 tests: verdict classification plus full runs against a real temp git repo
+npm test   # 27 tests: verdict classification, full runs against a real temp git repo, and native pytest / go runner detection, command building, and end to end fixture runs through the real binaries (skipped when a binary is unavailable)
 ```
 
 ## License

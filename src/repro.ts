@@ -21,15 +21,22 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type {
+  DetectedRunner,
   ExecFn,
   ExecResult,
   PhaseResult,
+  ReceiptPhase,
   ReproOptions,
+  ReproReceipt,
   ReproReport,
+  RunnerId,
   Verdict,
 } from "./types.js";
+import { buildNativeCommand, detectRunners } from "./runners.js";
 
-export const VERSION = "0.1.0";
+export type { NativeCommand, NativeCommandRequest } from "./runners.js";
+
+export const VERSION = "0.2.0";
 
 const execFileP = promisify(execFile);
 
@@ -69,6 +76,38 @@ export function classify(
     verdict: "BROKEN-BY-HEAD",
     detail:
       "The repro passes on the base and fails on the head. The change introduced this failure",
+  };
+}
+
+function receiptPhase(phase: PhaseResult): ReceiptPhase {
+  return {
+    ref: phase.ref,
+    sha: phase.sha,
+    exitCode: phase.exitCode,
+    outcome:
+      phase.exitCode === null ? "did-not-run" : phase.exitCode === 0 ? "pass" : "fail",
+    timedOut: phase.timedOut,
+    durationMs: phase.durationMs,
+  };
+}
+
+/** Build the machine readable red/green receipt for a completed report. */
+export function buildReceipt(
+  report: Omit<ReproReport, "receipt">,
+): ReproReceipt {
+  return {
+    schemaVersion: 1,
+    kind: "reprocheck.receipt",
+    verdict: report.verdict,
+    checkedAt: report.checkedAt,
+    repo: report.repo,
+    command: report.command,
+    runner: report.runner,
+    testFile: report.testFile,
+    testName: report.testName,
+    red: receiptPhase(report.base),
+    green: receiptPhase(report.head),
+    verified: report.verdict === "VERIFIED",
   };
 }
 
@@ -114,7 +153,7 @@ async function runPhase(
   ref: string,
   sha: string,
   worktree: string,
-  opts: ReproOptions,
+  opts: ReproOptions & { command: string },
   execFn: ExecFn,
   timeoutMs: number,
 ): Promise<PhaseResult> {
@@ -154,6 +193,38 @@ export async function runReproCheck(
   const repo = resolve(opts.repoPath);
   const timeoutMs = (opts.timeoutSeconds ?? 300) * 1000;
 
+  // Resolve a native runner request into a concrete command before any
+  // git work. Detection, wrong runner, no tests, and test name errors
+  // all fail here, with their specific messages, and nothing runs.
+  let runner: RunnerId | undefined;
+  let detection: DetectedRunner | undefined;
+  let command = opts.command;
+  let effectiveTestFile = opts.testFile;
+  if (opts.runner) {
+    if (opts.command) {
+      throw new Error("Pass either command or runner, not both");
+    }
+    const native = buildNativeCommand(repo, {
+      runner: opts.runner,
+      testFile: opts.testFile,
+      testName: opts.testName,
+    });
+    runner = native.runner;
+    detection = native.detection;
+    command = native.command;
+    effectiveTestFile = native.targetFile ?? opts.testFile;
+  } else if (opts.testName) {
+    throw new Error("testName requires a native runner (runner: pytest, go, or auto)");
+  }
+  if (!command) {
+    throw new Error("A repro command or a native runner is required");
+  }
+  const effectiveOpts: ReproOptions & { command: string } = {
+    ...opts,
+    command,
+    testFile: effectiveTestFile,
+  };
+
   // Validate the repo and resolve both refs before creating anything.
   await git(repo, ["rev-parse", "--git-dir"]).catch(() => {
     throw new Error(`${repo} is not a git repository`);
@@ -165,10 +236,10 @@ export async function runReproCheck(
     throw new Error(`Could not resolve head ref: ${opts.headRef}`);
   });
 
-  if (opts.testFile) {
-    const source = join(repo, opts.testFile);
+  if (effectiveTestFile) {
+    const source = join(repo, effectiveTestFile);
     if (!existsSync(source)) {
-      throw new Error(`Test file not found in the working tree: ${opts.testFile}`);
+      throw new Error(`Test file not found in the working tree: ${effectiveTestFile}`);
     }
   }
 
@@ -179,21 +250,24 @@ export async function runReproCheck(
     await git(repo, ["worktree", "add", "--detach", baseWt, baseSha]);
     await git(repo, ["worktree", "add", "--detach", headWt, headSha]);
 
-    if (opts.testFile) {
+    if (effectiveTestFile) {
       for (const wt of [baseWt, headWt]) {
-        const dest = join(wt, opts.testFile);
+        const dest = join(wt, effectiveTestFile);
         await mkdir(dirname(dest), { recursive: true });
-        await copyFile(join(repo, opts.testFile), dest);
+        await copyFile(join(repo, effectiveTestFile), dest);
       }
     }
 
-    const base = await runPhase("base", opts.baseRef, baseSha, baseWt, opts, execFn, timeoutMs);
-    const head = await runPhase("head", opts.headRef, headSha, headWt, opts, execFn, timeoutMs);
+    const base = await runPhase("base", opts.baseRef, baseSha, baseWt, effectiveOpts, execFn, timeoutMs);
+    const head = await runPhase("head", opts.headRef, headSha, headWt, effectiveOpts, execFn, timeoutMs);
     const { verdict, detail } = classify(base.exitCode, head.exitCode);
-    return {
+    const partial = {
       repo,
-      command: opts.command,
-      testFile: opts.testFile,
+      command,
+      runner,
+      detection,
+      testFile: effectiveTestFile,
+      testName: opts.testName,
       setupCommand: opts.setupCommand,
       base,
       head,
@@ -201,6 +275,7 @@ export async function runReproCheck(
       detail,
       checkedAt: new Date().toISOString(),
     };
+    return { ...partial, receipt: buildReceipt(partial) };
   } finally {
     await git(repo, ["worktree", "remove", "--force", baseWt]).catch(() => undefined);
     await git(repo, ["worktree", "remove", "--force", headWt]).catch(() => undefined);
@@ -218,6 +293,15 @@ export function renderReport(report: ReproReport): string {
   const lines: string[] = [];
   lines.push(`reprocheck: ${report.verdict}`);
   lines.push(`  command: ${report.command}`);
+  if (report.runner) {
+    lines.push(
+      `  runner: ${report.runner}${report.detection ? ` (evidence: ${report.detection.evidence.join(", ")})` : ""}`,
+    );
+  }
+  if (report.testName) lines.push(`  test name: ${report.testName}`);
+  lines.push(
+    `  receipt: red (base) exit ${report.receipt.red.exitCode ?? "n/a"}, green (head) exit ${report.receipt.green.exitCode ?? "n/a"}, verified ${report.receipt.verified}`,
+  );
   if (report.testFile) lines.push(`  test file copied into both worktrees: ${report.testFile}`);
   if (report.setupCommand) lines.push(`  setup: ${report.setupCommand}`);
   for (const [label, phase] of [

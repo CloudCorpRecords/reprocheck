@@ -26,4 +26,8 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm install
       - run: npm run build
+      # The native runner tests drive the real pytest and go binaries.
+      # Go and python3 are preinstalled on ubuntu-latest; pytest is not.
+      # Those tests skip cleanly when a binary is unavailable.
+      - run: python3 -m pip install pytest
       - run: npm test

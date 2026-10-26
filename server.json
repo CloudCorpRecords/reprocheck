@@ -6,13 +6,13 @@
     "url": "https://github.com/CloudCorpRecords/reprocheck",
     "source": "github"
   },
-  "version": "0.1.0",
+  "version": "0.2.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@reneturcios/reprocheck",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "runtimeHint": "npx",
       "packageArguments": [
         {
@@ -26,7 +26,7 @@
     },
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/cloudcorprecords/reprocheck:0.1.0",
+      "identifier": "ghcr.io/cloudcorprecords/reprocheck:0.2.0",
       "runtimeHint": "docker",
       "runtimeArguments": [
         {
